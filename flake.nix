@@ -44,6 +44,18 @@
           # Update this when go.mod/go.sum changes
           vendorHash = "sha256-SD5gL01LBrcUUhp2Z9SUqc10vSZjCrwx8KucGQFJsaU=";
 
+          # Build inputs
+          nativeBuildInputs = with pkgs; [
+            git # Required for git operations
+            makeWrapper # Required for wrapProgram
+            installShellFiles # For completion installation
+          ];
+
+          # Runtime dependencies
+          buildInputs = with pkgs; [
+            git
+          ];
+
           # Build flags
           ldflags = [
             "-s"
@@ -52,26 +64,21 @@
             "-X main.GitCommit=${gitCommit}"
           ];
 
-          # Build inputs
-          nativeBuildInputs = with pkgs; [
-            git # Required for git operations
-            makeWrapper # Required for wrapProgram
-          ];
-
-          # Runtime dependencies
-          buildInputs = with pkgs; [
-            git
-          ];
-
-          # Ensure git is available at runtime
           postInstall = ''
+            # Ensure git is available at runtime
             wrapProgram $out/bin/gala \
               --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.git ]}
+
+            # Generate and install shell completions
+            installShellCompletion --cmd gala \
+              --bash <($out/bin/gala completion bash) \
+              --zsh <($out/bin/gala completion zsh) \
+              --fish <($out/bin/gala completion fish)
           '';
 
           # Metadata
           meta = with pkgs.lib; {
-            description = "A high-performance command-line tool for analyzing git repository contributions by counting lines authored by different contributors.";
+            description = "Git Author Line Analyzer";
             homepage = "https://github.com/doprz/gala";
             license = licenses.mit;
             maintainers = with maintainers; [
@@ -103,6 +110,7 @@
 
             # Build tools
             gnumake
+            installShellFiles
 
             # Optional: useful development tools
             # jq # For JSON processing
@@ -115,6 +123,17 @@
             echo "Go version: $(go version)"
             echo "Git version: $(git --version)"
             echo ""
+            # echo "Available commands:"
+            # echo "  make build         - Build the binary"
+            # echo "  make test          - Run tests"
+            # echo "  make lint          - Run linter"
+            # echo "  make completions   - Generate completions"
+            # echo "  make install       - Install binary"
+            # echo ""
+            # echo "Nix commands:"
+            # echo "  nix run .          - Run gala directly"
+            # echo "  nix build          - Build the package"
+            # echo ""
           '';
 
           # Environment variables for development
@@ -156,21 +175,39 @@
         }:
         with lib;
         let
-          cfg = config.services.gala;
+          cfg = config.programs.gala;
         in
         {
-          options.services.gala = {
-            enable = mkEnableOption "Gala git analyzer service";
+          options.programs.gala = {
+            enable = mkEnableOption "Gala git analyzer";
 
             package = mkOption {
               type = types.package;
               default = self.packages.${pkgs.system}.gala;
               description = "The Gala package to use";
             };
+
+            settings = mkOption {
+              type = yamlFormat.type;
+              default = { };
+              description = "Global configuration for Gala";
+              example = {
+                output = "table";
+                emoji = true;
+                concurrency = 8;
+                min-lines = 10;
+              };
+            };
           };
 
           config = mkIf cfg.enable {
+            # Install the package system-wide
             environment.systemPackages = [ cfg.package ];
+
+            # Create global config file if settings are provided
+            environment.etc."gala/gala.yaml" = mkIf (cfg.settings != { }) {
+              source = yamlFormat.generate "gala.yaml" cfg.settings;
+            };
           };
         };
 
@@ -185,6 +222,7 @@
         with lib;
         let
           cfg = config.programs.gala;
+          yamlFormat = pkgs.formats.yaml { };
         in
         {
           options.programs.gala = {
@@ -197,23 +235,33 @@
             };
 
             settings = mkOption {
-              type = types.attrsOf types.anything;
+              type = yamlFormat.type;
               default = { };
               description = "Configuration for Gala";
               example = {
                 output = "table";
                 emoji = true;
                 concurrency = 8;
+                min-lines = 10;
+                exclude-author = [
+                  "bot"
+                  "automated"
+                ];
+                exclude-pattern = [
+                  "*.generated.*"
+                  "vendor/*"
+                ];
               };
             };
           };
 
           config = mkIf cfg.enable {
+            # Install the package
             home.packages = [ cfg.package ];
 
-            # Create config file if settings are provided
+            # Create user config file if settings are provided
             home.file.".config/gala/gala.yaml" = mkIf (cfg.settings != { }) {
-              text = builtins.toJSON cfg.settings;
+              source = yamlFormat.generate "gala.yaml" cfg.settings;
             };
           };
         };
