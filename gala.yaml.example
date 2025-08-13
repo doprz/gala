@@ -1,0 +1,72 @@
+# Gala Configuration File
+# Place this file as:
+# - ./gala.yaml (current directory)
+# - ~/.config/gala/gala.yaml (user config)
+# - /etc/gala/gala.yaml (system config)
+
+# Output format: table, json, csv, plain
+output: table
+
+# Sort results by: lines, name, files
+sort: lines
+
+# Maximum number of results to display (0 = no limit)
+limit: 20
+
+# Minimum lines threshold for inclusion
+min-lines: 1
+
+# Include emoji in output (🥇🥈🥉)
+emoji: true
+
+# Performance settings
+concurrency: 0  # 0 = auto (2 * CPU cores)
+
+# Output control
+quiet: false
+verbose: false
+no-progress: false
+
+# Date filtering (YYYY-MM-DD format)
+# since: "2024-01-01"
+# until: "2024-12-31"
+
+# Author filtering
+exclude-author:
+  - "bot"
+  - "automated"
+  - "dependabot[bot]"
+  - "github-actions[bot]"
+
+# Include only specific authors (if specified, only these will be included)
+# include-author:
+#   - "Alice Johnson"
+#   - "Bob Smith"
+
+# Additional file patterns to exclude (beyond defaults and .gitignore)
+exclude-pattern:
+  - "*.generated.*"
+  - "*.pb.go"
+  - "*.pb.gw.go"
+  - "*_test.go"        # Uncomment to exclude test files
+  - "vendor/*"
+  - "node_modules/*"
+  - "dist/*"
+  - "build/*"
+  - ".next/*"
+  - ".nuxt/*"
+  - "target/*"
+  - "*.min.*"
+
+# Default patterns are automatically excluded:
+# Lock files: *-lock.*, *.lock, Cargo.lock, yarn.lock, package-lock.json
+# Images: *.gif, *.png, *.jpg, *.jpeg, *.webp, *.ico, *.svg, etc.
+# Fonts: *.woff, *.woff2, *.ttf, *.otf, *.eot
+# Media: *.mp4, *.avi, *.mov, *.mp3, *.wav, etc.
+# Archives: *.zip, *.tar, *.tgz, *.rar, *.7z, etc.
+# Binaries: *.exe, *.dll, *.so, *.dylib, *.bin, etc.
+# Documents: *.pdf, *.doc, *.docx, *.xls, *.xlsx, etc.
+# Compiled: *.o, *.obj, *.class, *.pyc, *.jar, etc.
+# OS files: .DS_Store, Thumbs.db, desktop.ini
+# IDE files: *.swp, *.swo, *~
+# And many more...

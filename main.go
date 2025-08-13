@@ -1,92 +1,131 @@
 package main
 
 import (
-	"slices"
 	"bufio"
 	"context"
+	"encoding/csv"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/olekukonko/tablewriter"
 	"github.com/schollz/progressbar/v3"
 	"github.com/spf13/cobra"
+	"github.com/spf13/viper"
 	"golang.org/x/sync/errgroup"
 )
 
-// Version and build info
-const (
-	Version     = "1.0.0"
-	AppName     = "Gala"
-	Description = "Git Author Line Analyzer - Analyzes git blame data to show author contributions"
+// Version and build info - set via ldflags
+var (
+	Version   = "dev"
+	GitCommit = "unknown"
 )
 
-// Styles for consistent UI
-var (
-	titleStyle = lipgloss.NewStyle().
-			Bold(true).
-			Foreground(lipgloss.Color("39")). // Cyan
-			Render
+const (
+	AppName     = "Gala"
+	Description = "A high-performance command-line tool for analyzing git repository contributions by counting lines authored by different contributors."
+)
 
-	headerStyle = lipgloss.NewStyle().
-			Bold(true).
-			Foreground(lipgloss.Color("12")). // Blue
-			Render
+// OutputFormat represents different output formats
+type OutputFormat string
 
-	successStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("10")). // Green
-			Render
+const (
+	FormatTable OutputFormat = "table"
+	FormatJSON  OutputFormat = "json"
+	FormatCSV   OutputFormat = "csv"
+	FormatPlain OutputFormat = "plain"
+)
 
-	warningStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("11")). // Yellow
-			Render
+// SortBy represents different sorting options
+type SortBy string
 
-	errorStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("9")). // Red
-			Render
-
-	dimStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("8")). // Gray
-			Render
+const (
+	SortByLines SortBy = "lines"
+	SortByName  SortBy = "name"
+	SortByFiles SortBy = "files"
 )
 
 // Config holds application configuration
 type Config struct {
-	Directory   string
-	Username    string
-	Concurrency int
-	ShowHelp    bool
-	Verbose     bool
+	Directory     string
+	Username      string
+	Concurrency   int
+	OutputFormat  OutputFormat
+	SortBy        SortBy
+	MinLines      int
+	MaxResults    int
+	IncludeEmoji  bool
+	Quiet         bool
+	Verbose       bool
+	NoProgress    bool
+	ExcludeAuthor []string
+	IncludeAuthor []string
+	DateSince     string
+	DateUntil     string
+	ExtraPatterns []string
+	ConfigFile    string
 }
 
 // AuthorStats represents statistics for an author
 type AuthorStats struct {
-	Name      string
-	LineCount int
+	Name        string  `json:"name"`
+	LineCount   int     `json:"line_count"`
+	FileCount   int     `json:"file_count"`
+	FirstCommit string  `json:"first_commit,omitempty"`
+	LastCommit  string  `json:"last_commit,omitempty"`
+	Percentage  float64 `json:"percentage"`
 }
 
 // FileContribution represents a file contribution by a user
 type FileContribution struct {
-	Path      string
-	LineCount int
+	Path      string `json:"path"`
+	LineCount int    `json:"line_count"`
 }
 
 // AnalysisResult holds the results of git analysis
 type AnalysisResult struct {
-	Authors           []AuthorStats
-	UserContributions []FileContribution
-	TotalLines        int
-	FilesProcessed    int
-	TotalFiles        int
+	Authors           []AuthorStats      `json:"authors"`
+	UserContributions []FileContribution `json:"user_contributions,omitempty"`
+	TotalLines        int                `json:"total_lines"`
+	FilesProcessed    int                `json:"files_processed"`
+	TotalFiles        int                `json:"total_files"`
+	ProcessingTime    time.Duration      `json:"processing_time"`
+	Repository        string             `json:"repository"`
+	GeneratedAt       time.Time          `json:"generated_at"`
 }
+
+// Styles for consistent UI
+var (
+	headerStyle = lipgloss.NewStyle().
+			Bold(true).
+			Foreground(lipgloss.Color("12"))
+
+	successStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("10"))
+
+	warningStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("11"))
+
+	errorStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("9"))
+
+	dimStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("8"))
+
+	primaryStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("14"))
+)
 
 // GitAnalyzer handles git repository analysis
 type GitAnalyzer struct {
@@ -107,7 +146,7 @@ func NewGitAnalyzer(config Config) *GitAnalyzer {
 func getDefaultExcludePatterns() []string {
 	return []string{
 		// Lock files
-		"*-lock.*", "*.lock",
+		"*-lock.*", "*.lock", "Cargo.lock", "yarn.lock", "package-lock.json", "poetry.lock",
 		// Images
 		"*.gif", "*.png", "*.jpg", "*.jpeg", "*.webp", "*.ico", "*.tiff", "*.tif", "*.bmp", "*.svg",
 		// Fonts
@@ -129,7 +168,7 @@ func getDefaultExcludePatterns() []string {
 		// OS files
 		".DS_Store", "Thumbs.db", "desktop.ini", ".directory",
 		// IDE files
-		"*.swp", "*.swo", "*~",
+		"*.swp", "*.swo", "*~", "*.tmp",
 		// Logs
 		"*.log", "*.logs",
 		// Certificates
@@ -141,7 +180,6 @@ func getDefaultExcludePatterns() []string {
 
 // validateDirectory checks if the directory exists and is a git repository
 func (ga *GitAnalyzer) validateDirectory() error {
-	// Check if directory exists
 	info, err := os.Stat(ga.config.Directory)
 	if err != nil {
 		return fmt.Errorf("directory %q does not exist", ga.config.Directory)
@@ -151,7 +189,6 @@ func (ga *GitAnalyzer) validateDirectory() error {
 		return fmt.Errorf("%q is not a directory", ga.config.Directory)
 	}
 
-	// Check if it's a git repository
 	gitDir := filepath.Join(ga.config.Directory, ".git")
 	if _, err := os.Stat(gitDir); err != nil {
 		return fmt.Errorf("%q is not a git repository", ga.config.Directory)
@@ -166,8 +203,7 @@ func (ga *GitAnalyzer) loadGitignorePatterns() error {
 
 	file, err := os.Open(gitignorePath)
 	if err != nil {
-		// .gitignore doesn't exist, that's okay
-		return nil
+		return nil // .gitignore doesn't exist, that's okay
 	}
 	defer file.Close()
 
@@ -177,17 +213,14 @@ func (ga *GitAnalyzer) loadGitignorePatterns() error {
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 
-		// Skip empty lines and comments
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
 
-		// Skip negation patterns for simplicity
 		if strings.HasPrefix(line, "!") {
 			continue
 		}
 
-		// Convert gitignore pattern to glob pattern
 		pattern := line
 		if strings.HasSuffix(pattern, "/") {
 			pattern = strings.TrimSuffix(pattern, "/")
@@ -198,8 +231,7 @@ func (ga *GitAnalyzer) loadGitignorePatterns() error {
 
 	ga.gitignoreGlobs = patterns
 	if len(patterns) > 0 && ga.config.Verbose {
-		fmt.Printf("%s Loaded %d patterns from .gitignore\n",
-			successStyle("✓"), len(patterns))
+		ga.logInfo("Loaded %d patterns from .gitignore", len(patterns))
 	}
 
 	return scanner.Err()
@@ -211,6 +243,16 @@ func (ga *GitAnalyzer) shouldExcludeFile(filePath string) bool {
 
 	// Check default exclude patterns
 	for _, pattern := range ga.excludePatterns {
+		if matched, _ := filepath.Match(pattern, fileName); matched {
+			return true
+		}
+		if matched, _ := filepath.Match(pattern, filePath); matched {
+			return true
+		}
+	}
+
+	// Check extra patterns from config
+	for _, pattern := range ga.config.ExtraPatterns {
 		if matched, _ := filepath.Match(pattern, fileName); matched {
 			return true
 		}
@@ -241,30 +283,26 @@ func (ga *GitAnalyzer) findFiles() ([]string, error) {
 
 	err := filepath.Walk(ga.config.Directory, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
-			return nil // Skip files we can't access
-		}
-
-		// Skip directories
-		if info.IsDir() {
-			// Skip common directories
-			dirName := filepath.Base(path)
-			skipDirs := []string{
-				".git", "node_modules", "vendor", ".cache", "__pycache__",
-				".vscode", ".idea", ".vs", "dist", "build",
-			}
-			if slices.Contains(skipDirs, dirName) {
-					return filepath.SkipDir
-				}
 			return nil
 		}
 
-		// Get relative path from target directory
+		if info.IsDir() {
+			dirName := filepath.Base(path)
+			skipDirs := []string{
+				".git", "node_modules", "vendor", ".cache", "__pycache__",
+				".vscode", ".idea", ".vs", "dist", "build", ".next", ".nuxt",
+			}
+			if slices.Contains(skipDirs, dirName) {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+
 		relPath, err := filepath.Rel(ga.config.Directory, path)
 		if err != nil {
 			return nil
 		}
 
-		// Check if file should be excluded
 		if !ga.shouldExcludeFile(relPath) {
 			files = append(files, path)
 		}
@@ -284,14 +322,24 @@ type BlameResult struct {
 
 // runGitBlame runs git blame on a single file
 func (ga *GitAnalyzer) runGitBlame(ctx context.Context, filePath string) BlameResult {
-	// Convert to relative path for git blame
 	relPath, err := filepath.Rel(ga.config.Directory, filePath)
 	if err != nil {
 		return BlameResult{FilePath: filePath, Error: err}
 	}
 
-	// Run git blame with options for better accuracy
-	cmd := exec.CommandContext(ctx, "git", "blame", "-M", "-C", "-w", "--line-porcelain", relPath)
+	args := []string{"blame", "-M", "-C", "-w", "--line-porcelain"}
+
+	// Add date filtering if specified
+	if ga.config.DateSince != "" {
+		args = append(args, "--since="+ga.config.DateSince)
+	}
+	if ga.config.DateUntil != "" {
+		args = append(args, "--until="+ga.config.DateUntil)
+	}
+
+	args = append(args, relPath)
+
+	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = ga.config.Directory
 
 	output, err := cmd.Output()
@@ -299,14 +347,13 @@ func (ga *GitAnalyzer) runGitBlame(ctx context.Context, filePath string) BlameRe
 		return BlameResult{FilePath: filePath, Error: err}
 	}
 
-	// Parse authors from porcelain output
 	authors := make([]string, 0)
 	lines := strings.SplitSeq(string(output), "\n")
 
 	for line := range lines {
 		if strings.HasPrefix(line, "author ") {
 			author := strings.TrimPrefix(line, "author ")
-			if author != "" {
+			if author != "" && !ga.shouldExcludeAuthor(author) {
 				authors = append(authors, author)
 			}
 		}
@@ -315,35 +362,57 @@ func (ga *GitAnalyzer) runGitBlame(ctx context.Context, filePath string) BlameRe
 	return BlameResult{FilePath: filePath, Authors: authors}
 }
 
+// shouldExcludeAuthor checks if an author should be excluded
+func (ga *GitAnalyzer) shouldExcludeAuthor(author string) bool {
+	// Check exclude list
+	for _, excluded := range ga.config.ExcludeAuthor {
+		if strings.EqualFold(author, excluded) {
+			return true
+		}
+	}
+
+	// Check include list (if specified, only include listed authors)
+	if len(ga.config.IncludeAuthor) > 0 {
+		included := false
+		for _, includedAuthor := range ga.config.IncludeAuthor {
+			if strings.EqualFold(author, includedAuthor) {
+				included = true
+				break
+			}
+		}
+		return !included
+	}
+
+	return false
+}
+
 // processFiles processes files concurrently and returns analysis results
 func (ga *GitAnalyzer) processFiles(ctx context.Context, files []string) (*AnalysisResult, error) {
-	// Create worker pool
+	startTime := time.Now()
+
 	concurrency := ga.config.Concurrency
 	if concurrency <= 0 {
 		concurrency = runtime.NumCPU() * 2
 	}
 
-	// Create progress bar
-	bar := progressbar.NewOptions(len(files),
-		progressbar.OptionSetDescription("Processing files..."),
-		progressbar.OptionSetTheme(progressbar.Theme{
-			Saucer:        "█",
-			SaucerPadding: "░",
-			BarStart:      "[",
-			BarEnd:        "]",
-		}),
-		progressbar.OptionShowCount(),
-		progressbar.OptionShowIts(),
-		progressbar.OptionSetWidth(50),
-	)
+	var bar *progressbar.ProgressBar
+	if !ga.config.NoProgress && !ga.config.Quiet {
+		bar = progressbar.NewOptions(len(files),
+			progressbar.OptionSetDescription("Processing files"),
+			progressbar.OptionSetTheme(progressbar.Theme{
+				Saucer:        "█",
+				SaucerPadding: "░",
+				BarStart:      "[",
+				BarEnd:        "]",
+			}),
+			progressbar.OptionShowCount(),
+			progressbar.OptionShowIts(),
+			progressbar.OptionSetWidth(50),
+		)
+	}
 
-	// Results channels
 	resultsChan := make(chan BlameResult, len(files))
-
-	// Worker group
 	g, ctx := errgroup.WithContext(ctx)
-
-	// Input channel for file paths
 	fileChan := make(chan string, len(files))
 
 	// Start workers
@@ -356,7 +425,9 @@ func (ga *GitAnalyzer) processFiles(ctx context.Context, files []string) (*Analy
 				default:
 					result := ga.runGitBlame(ctx, filePath)
 					resultsChan <- result
-					bar.Add(1)
+					if bar != nil {
+						bar.Add(1)
+					}
 				}
 			}
 			return nil
@@ -383,6 +454,7 @@ func (ga *GitAnalyzer) processFiles(ctx context.Context, files []string) (*Analy
 
 	// Process results
 	authorCounts := make(map[string]int)
+	authorFiles := make(map[string]map[string]bool)
 	userContributions := make(map[string]int)
 	totalLines := 0
 	filesProcessed := 0
@@ -390,19 +462,23 @@ func (ga *GitAnalyzer) processFiles(ctx context.Context, files []string) (*Analy
 	for result := range resultsChan {
 		if result.Error != nil {
 			if ga.config.Verbose {
-				fmt.Printf("%s Error processing %s: %v\n",
-					warningStyle("⚠"), result.FilePath, result.Error)
+				ga.logWarn("Error processing %s: %v", result.FilePath, result.Error)
 			}
 			continue
 		}
 
 		filesProcessed++
 
-		// Count authors
 		for _, author := range result.Authors {
 			if author != "" {
 				authorCounts[author]++
 				totalLines++
+
+				// Track files per author
+				if authorFiles[author] == nil {
+					authorFiles[author] = make(map[string]bool)
+				}
+				authorFiles[author][result.FilePath] = true
 
 				// If filtering for specific user, track per-file contributions
 				if ga.config.Username != "" && author == ga.config.Username {
@@ -413,10 +489,11 @@ func (ga *GitAnalyzer) processFiles(ctx context.Context, files []string) (*Analy
 		}
 	}
 
-	bar.Finish()
-	fmt.Println() // Add line break after progress bar
+	if bar != nil {
+		bar.Finish()
+		fmt.Println()
+	}
 
-	// Check for worker errors
 	if err := g.Wait(); err != nil {
 		return nil, err
 	}
@@ -424,13 +501,25 @@ func (ga *GitAnalyzer) processFiles(ctx context.Context, files []string) (*Analy
 	// Convert to sorted slices
 	authors := make([]AuthorStats, 0, len(authorCounts))
 	for name, count := range authorCounts {
-		authors = append(authors, AuthorStats{Name: name, LineCount: count})
+		if count >= ga.config.MinLines {
+			fileCount := len(authorFiles[name])
+			percentage := float64(count) / float64(totalLines) * 100
+			authors = append(authors, AuthorStats{
+				Name:       name,
+				LineCount:  count,
+				FileCount:  fileCount,
+				Percentage: percentage,
+			})
+		}
 	}
 
-	// Sort authors by line count (descending)
-	sort.Slice(authors, func(i, j int) bool {
-		return authors[i].LineCount > authors[j].LineCount
-	})
+	// Sort authors
+	ga.sortAuthors(authors)
+
+	// Limit results if specified
+	if ga.config.MaxResults > 0 && len(authors) > ga.config.MaxResults {
+		authors = authors[:ga.config.MaxResults]
+	}
 
 	// Convert user contributions to sorted slice
 	contributions := make([]FileContribution, 0, len(userContributions))
@@ -438,10 +527,14 @@ func (ga *GitAnalyzer) processFiles(ctx context.Context, files []string) (*Analy
 		contributions = append(contributions, FileContribution{Path: path, LineCount: count})
 	}
 
-	// Sort contributions by line count (descending)
 	sort.Slice(contributions, func(i, j int) bool {
 		return contributions[i].LineCount > contributions[j].LineCount
 	})
+
+	// Limit contributions if specified
+	if ga.config.MaxResults > 0 && len(contributions) > ga.config.MaxResults {
+		contributions = contributions[:ga.config.MaxResults]
+	}
 
 	return &AnalysisResult{
 		Authors:           authors,
@@ -449,142 +542,255 @@ func (ga *GitAnalyzer) processFiles(ctx context.Context, files []string) (*Analy
 		TotalLines:        totalLines,
 		FilesProcessed:    filesProcessed,
 		TotalFiles:        len(files),
+		ProcessingTime:    time.Since(startTime),
+		Repository:        ga.config.Directory,
+		GeneratedAt:       time.Now(),
 	}, nil
 }
 
-// displayResults displays the analysis results
-func (ga *GitAnalyzer) displayResults(result *AnalysisResult) {
-	if ga.config.Username != "" {
-		ga.displayUserResults(result)
-	} else {
-		ga.displayAuthorResults(result)
+// sortAuthors sorts authors based on the configured sort option
+func (ga *GitAnalyzer) sortAuthors(authors []AuthorStats) {
+	switch ga.config.SortBy {
+	case SortByLines:
+		sort.Slice(authors, func(i, j int) bool {
+			return authors[i].LineCount > authors[j].LineCount
+		})
+	case SortByName:
+		sort.Slice(authors, func(i, j int) bool {
+			return authors[i].Name < authors[j].Name
+		})
+	case SortByFiles:
+		sort.Slice(authors, func(i, j int) bool {
+			return authors[i].FileCount > authors[j].FileCount
+		})
 	}
 }
 
-// displayAuthorResults displays results for all authors
-func (ga *GitAnalyzer) displayAuthorResults(result *AnalysisResult) {
-	fmt.Printf("\n%s\n", headerStyle("🏆 Author Contributions by Lines"))
+// displayResults displays the analysis results based on format
+func (ga *GitAnalyzer) displayResults(result *AnalysisResult) error {
+	switch ga.config.OutputFormat {
+	case FormatJSON:
+		return ga.outputJSON(result)
+	case FormatCSV:
+		return ga.outputCSV(result)
+	case FormatPlain:
+		return ga.outputPlain(result)
+	default:
+		return ga.outputTable(result)
+	}
+}
 
-	if len(result.Authors) == 0 {
-		fmt.Printf("%s No authors found!\n", warningStyle("⚠"))
-		return
+// outputJSON outputs results in JSON format
+func (ga *GitAnalyzer) outputJSON(result *AnalysisResult) error {
+	encoder := json.NewEncoder(os.Stdout)
+	encoder.SetIndent("", "  ")
+	return encoder.Encode(result)
+}
+
+// outputCSV outputs results in CSV format
+func (ga *GitAnalyzer) outputCSV(result *AnalysisResult) error {
+	writer := csv.NewWriter(os.Stdout)
+	defer writer.Flush()
+
+	if ga.config.Username != "" {
+		// User-specific CSV
+		writer.Write([]string{"File", "Lines"})
+		for _, contrib := range result.UserContributions {
+			writer.Write([]string{contrib.Path, strconv.Itoa(contrib.LineCount)})
+		}
+	} else {
+		// Authors CSV
+		writer.Write([]string{"Author", "Lines", "Files", "Percentage"})
+		for _, author := range result.Authors {
+			writer.Write([]string{
+				author.Name,
+				strconv.Itoa(author.LineCount),
+				strconv.Itoa(author.FileCount),
+				fmt.Sprintf("%.2f", author.Percentage),
+			})
+		}
 	}
 
-	// Create table
+	return nil
+}
+
+// outputPlain outputs results in plain text format
+func (ga *GitAnalyzer) outputPlain(result *AnalysisResult) error {
+	if ga.config.Username != "" {
+		fmt.Printf("User: %s\n", ga.config.Username)
+		fmt.Printf("Total Lines: %s\n", formatNumber(result.getTotalUserLines()))
+		fmt.Printf("Files: %d\n\n", len(result.UserContributions))
+
+		for _, contrib := range result.UserContributions {
+			fmt.Printf("%s\t%s\n", formatNumber(contrib.LineCount), contrib.Path)
+		}
+	} else {
+		fmt.Printf("Total Lines: %s\n", formatNumber(result.TotalLines))
+		fmt.Printf("Authors: %d\n", len(result.Authors))
+		fmt.Printf("Files: %d\n\n", result.FilesProcessed)
+
+		for _, author := range result.Authors {
+			fmt.Printf("%s\t%s\t%s\t%.2f%%\n",
+				formatNumber(author.LineCount),
+				formatNumber(author.FileCount),
+				author.Name,
+				author.Percentage)
+		}
+	}
+
+	return nil
+}
+
+// outputTable outputs results in table format
+func (ga *GitAnalyzer) outputTable(result *AnalysisResult) error {
+	if ga.config.Username != "" {
+		return ga.displayUserResults(result)
+	}
+	return ga.displayAuthorResults(result)
+}
+
+// displayAuthorResults displays results for all authors
+func (ga *GitAnalyzer) displayAuthorResults(result *AnalysisResult) error {
+	if !ga.config.Quiet {
+		fmt.Printf("\n%s\n", ga.styleHeader("Author Contributions"))
+	}
+
+	if len(result.Authors) == 0 {
+		if !ga.config.Quiet {
+			ga.logWarn("No authors found matching criteria")
+		}
+		return nil
+	}
+
 	table := tablewriter.NewWriter(os.Stdout)
-	table.Header([]string{"Rank", "Lines", "Author"})
+	headers := []string{"Rank", "Lines", "Files", "Percentage", "Author"}
 
-	// Show top 20 authors
-	displayCount := min(len(result.Authors), 20)
+	if !ga.config.IncludeEmoji {
+		headers[0] = "Rank"
+	}
 
-	for i := range displayCount {
-		author := result.Authors[i]
+	table.Header(headers)
+
+	for i, author := range result.Authors {
 		rank := fmt.Sprintf("%d", i+1)
 
-		// Add medals for top 3
-		switch i {
-		case 0:
-			rank = "🥇"
-		case 1:
-			rank = "🥈"
-		case 2:
-			rank = "🥉"
+		if ga.config.IncludeEmoji {
+			switch i {
+			case 0:
+				rank = "🥇"
+			case 1:
+				rank = "🥈"
+			case 2:
+				rank = "🥉"
+			}
 		}
 
 		table.Append([]string{
 			rank,
 			formatNumber(author.LineCount),
+			formatNumber(author.FileCount),
+			fmt.Sprintf("%.1f%%", author.Percentage),
 			author.Name,
 		})
 	}
 
 	table.Render()
 
-	if len(result.Authors) > displayCount {
-		fmt.Printf("%s ... and %d more authors\n\n",
-			dimStyle(""), len(result.Authors)-displayCount)
+	if !ga.config.Quiet {
+		ga.displaySummary(result)
 	}
 
-	// Summary
-	ga.displaySummary(result)
+	return nil
 }
 
 // displayUserResults displays results for a specific user
-func (ga *GitAnalyzer) displayUserResults(result *AnalysisResult) {
-	fmt.Printf("\n%s\n", headerStyle(fmt.Sprintf("📝 %s's Contributions by File", ga.config.Username)))
-
-	if len(result.UserContributions) == 0 {
-		fmt.Printf("%s No contributions found for user %q\n",
-			warningStyle("⚠"), ga.config.Username)
-		return
+func (ga *GitAnalyzer) displayUserResults(result *AnalysisResult) error {
+	if !ga.config.Quiet {
+		fmt.Printf("\n%s\n", ga.styleHeader(fmt.Sprintf("%s's Contributions", ga.config.Username)))
 	}
 
-	// Create table
+	if len(result.UserContributions) == 0 {
+		if !ga.config.Quiet {
+			ga.logWarn("No contributions found for user %q", ga.config.Username)
+		}
+		return nil
+	}
+
 	table := tablewriter.NewWriter(os.Stdout)
 	table.Header([]string{"Lines", "File"})
-	// Show top 20 files
-	displayCount := min(len(result.UserContributions), 20)
 
-	totalUserLines := 0
-	for i := range displayCount {
-		contrib := result.UserContributions[i]
-		totalUserLines += contrib.LineCount
-
+	for _, contrib := range result.UserContributions {
 		table.Append([]string{
 			formatNumber(contrib.LineCount),
 			contrib.Path,
 		})
 	}
 
-	// Count total user lines across all files
-	for _, contrib := range result.UserContributions {
-		if displayCount >= len(result.UserContributions) {
-			break
-		}
-		totalUserLines += contrib.LineCount
-	}
-
 	table.Render()
 
-	if len(result.UserContributions) > displayCount {
-		fmt.Printf("%s ... and %d more files\n\n",
-			dimStyle(""), len(result.UserContributions)-displayCount)
+	if !ga.config.Quiet {
+		summaryTable := tablewriter.NewWriter(os.Stdout)
+		summaryTable.Header([]string{"Metric", "Value"})
+
+		userTotal := result.getTotalUserLines()
+
+		summaryTable.Append([]string{"Total lines", formatNumber(userTotal)})
+		summaryTable.Append([]string{"Files contributed", formatNumber(len(result.UserContributions))})
+		summaryTable.Append([]string{"Processing time", result.ProcessingTime.Round(time.Millisecond).String()})
+
+		fmt.Printf("\n%s\n", ga.styleHeader("Summary"))
+		summaryTable.Render()
 	}
 
-	// User-specific summary
-	summaryTable := tablewriter.NewWriter(os.Stdout)
-	summaryTable.Header([]string{"Metric", "Value"})
-
-	// Calculate total user lines
-	userTotal := 0
-	for _, contrib := range result.UserContributions {
-		userTotal += contrib.LineCount
-	}
-
-	summaryTable.Append([]string{"Total lines by " + ga.config.Username, formatNumber(userTotal)})
-	summaryTable.Append([]string{"Files contributed to", formatNumber(len(result.UserContributions))})
-	summaryTable.Append([]string{"Files processed", formatNumber(result.FilesProcessed)})
-
-	fmt.Printf("\n%s\n", titleStyle("📊 SUMMARY"))
-	summaryTable.Render()
+	return nil
 }
 
 // displaySummary displays summary statistics
 func (ga *GitAnalyzer) displaySummary(result *AnalysisResult) {
 	summaryTable := tablewriter.NewWriter(os.Stdout)
 	summaryTable.Header([]string{"Metric", "Value"})
-	// summaryTable.SetHeaderColor(
-	// 	tablewriter.Colors{tablewriter.FgCyanColor, tablewriter.Bold},
-	// 	tablewriter.Colors{tablewriter.FgCyanColor, tablewriter.Bold},
-	// )
-	// summaryTable.SetBorder(true)
 
 	summaryTable.Append([]string{"Total lines analyzed", formatNumber(result.TotalLines)})
 	summaryTable.Append([]string{"Unique authors", formatNumber(len(result.Authors))})
 	summaryTable.Append([]string{"Files processed", formatNumber(result.FilesProcessed)})
+	summaryTable.Append([]string{"Processing time", result.ProcessingTime.Round(time.Millisecond).String()})
 
-	fmt.Printf("\n%s\n", titleStyle("📊 SUMMARY"))
+	fmt.Printf("\n%s\n", ga.styleHeader("Summary"))
 	summaryTable.Render()
+}
+
+// getTotalUserLines calculates total lines for user contributions
+func (result *AnalysisResult) getTotalUserLines() int {
+	total := 0
+	for _, contrib := range result.UserContributions {
+		total += contrib.LineCount
+	}
+	return total
+}
+
+// Logging methods
+func (ga *GitAnalyzer) logInfo(format string, args ...any) {
+	if !ga.config.Quiet {
+		fmt.Printf("[INFO] "+format+"\n", args...)
+	}
+}
+
+func (ga *GitAnalyzer) logWarn(format string, args ...any) {
+	if !ga.config.Quiet {
+		fmt.Printf("%s "+format+"\n", append([]any{warningStyle.Render("[WARN]")}, args...)...)
+	}
+}
+
+func (ga *GitAnalyzer) logError(format string, args ...any) {
+	fmt.Printf("%s "+format+"\n", append([]any{errorStyle.Render("[ERROR]")}, args...)...)
+}
+
+// TODO:
+func (ga *GitAnalyzer) styleHeader(text string) string {
+	if ga.config.IncludeEmoji {
+		return headerStyle.Render("📊 " + text)
+	}
+	return headerStyle.Render(text)
 }
 
 // formatNumber formats a number with commas
@@ -606,23 +812,20 @@ func formatNumber(n int) string {
 
 // Run executes the analysis
 func (ga *GitAnalyzer) Run(ctx context.Context) error {
-	// Validate directory
 	if err := ga.validateDirectory(); err != nil {
 		return err
 	}
 
-	// Load gitignore patterns
 	if err := ga.loadGitignorePatterns(); err != nil {
 		return fmt.Errorf("failed to load .gitignore: %w", err)
 	}
 
-	// Find files
-	fmt.Printf("%s Scanning directory: %s\n",
-		titleStyle("🔍"), ga.config.Directory)
+	if !ga.config.Quiet {
+		ga.logInfo("Scanning directory: %s", ga.config.Directory)
 
-	if ga.config.Username != "" {
-		fmt.Printf("%s Analyzing contributions by user: %s\n",
-			headerStyle("ℹ"), ga.config.Username)
+		if ga.config.Username != "" {
+			ga.logInfo("Analyzing contributions by user: %s", ga.config.Username)
+		}
 	}
 
 	files, err := ga.findFiles()
@@ -630,26 +833,21 @@ func (ga *GitAnalyzer) Run(ctx context.Context) error {
 		return fmt.Errorf("failed to find files: %w", err)
 	}
 
-	fmt.Printf("%s Found %s files to analyze\n",
-		successStyle("✓"), successStyle(formatNumber(len(files))))
-
-	if len(files) == 0 {
-		fmt.Printf("%s No files found to analyze!\n", warningStyle("⚠"))
-		return nil
+	if !ga.config.Quiet {
+		ga.logInfo("Found %s files to analyze", formatNumber(len(files)))
 	}
 
-	// Process files
-	fmt.Printf("\n%s\n", headerStyle("📊 Processing Files"))
+	if len(files) == 0 {
+		ga.logWarn("No files found to analyze")
+		return nil
+	}
 
 	result, err := ga.processFiles(ctx, files)
 	if err != nil {
 		return fmt.Errorf("failed to process files: %w", err)
 	}
 
-	// Display results
-	ga.displayResults(result)
-
-	return nil
+	return ga.displayResults(result)
 }
 
 // CLI setup
@@ -657,11 +855,172 @@ func main() {
 	var config Config
 
 	rootCmd := &cobra.Command{
-		Use:   "gala [directory] [username]",
-		Short: Description,
-		Long: fmt.Sprintf(`%s
+		Use:     "gala [directory] [username]",
+		Short:   Description,
+		Long:    buildLongDescription(),
+		Version: fmt.Sprintf("%s (commit: %s)", Version, GitCommit),
+		Args:    cobra.MaximumNArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if len(args) >= 1 {
+				config.Directory = args[0]
+			} else {
+				config.Directory = "."
+			}
 
-Analyzes git blame data to show author contributions by line count.
+			if len(args) >= 2 {
+				config.Username = args[1]
+			}
+
+			absPath, err := filepath.Abs(config.Directory)
+			if err != nil {
+				return fmt.Errorf("invalid directory path: %w", err)
+			}
+			config.Directory = absPath
+
+			analyzer := NewGitAnalyzer(config)
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			sigChan := make(chan os.Signal, 1)
+			signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+			go func() {
+				<-sigChan
+				if !config.Quiet {
+					fmt.Printf("\nReceived interrupt signal, shutting down gracefully...\n")
+				}
+				cancel()
+			}()
+
+			return analyzer.Run(ctx)
+		},
+	}
+
+	// Output options
+	rootCmd.Flags().StringVarP((*string)(&config.OutputFormat), "output", "o", "table",
+		"Output format: table, json, csv, plain")
+	rootCmd.Flags().StringVar((*string)(&config.SortBy), "sort", "lines",
+		"Sort by: lines, name, files")
+	rootCmd.Flags().IntVar(&config.MaxResults, "limit", 0,
+		"Limit number of results (0 = no limit)")
+	rootCmd.Flags().BoolVar(&config.IncludeEmoji, "emoji", false,
+		"Include emoji in output")
+
+	// Filtering options
+	rootCmd.Flags().IntVar(&config.MinLines, "min-lines", 1,
+		"Minimum lines threshold for inclusion")
+	rootCmd.Flags().StringSliceVar(&config.ExcludeAuthor, "exclude-author", nil,
+		"Exclude specific authors")
+	rootCmd.Flags().StringSliceVar(&config.IncludeAuthor, "include-author", nil,
+		"Include only specific authors")
+	rootCmd.Flags().StringVar(&config.DateSince, "since", "",
+		"Only count lines since date (YYYY-MM-DD)")
+	rootCmd.Flags().StringVar(&config.DateUntil, "until", "",
+		"Only count lines until date (YYYY-MM-DD)")
+	rootCmd.Flags().StringSliceVar(&config.ExtraPatterns, "exclude-pattern", nil,
+		"Additional file patterns to exclude")
+
+	// Behavior options
+	rootCmd.Flags().IntVarP(&config.Concurrency, "concurrency", "c", 0,
+		"Number of concurrent processes (default: 2*CPU cores)")
+	rootCmd.Flags().BoolVarP(&config.Verbose, "verbose", "v", false,
+		"Enable verbose output")
+	rootCmd.Flags().BoolVarP(&config.Quiet, "quiet", "q", false,
+		"Suppress all output except results")
+	rootCmd.Flags().BoolVar(&config.NoProgress, "no-progress", false,
+		"Disable progress bar")
+	rootCmd.Flags().StringVar(&config.ConfigFile, "config", "",
+		"Config file path")
+
+	// Shell completion commands
+	completionCmd := &cobra.Command{
+		Use:   "completion [bash|zsh|fish|powershell]",
+		Short: "Generate completion script",
+		Long: `To load completions:
+
+Bash:
+  $ source <(gala completion bash)
+  
+  # To load completions for each session, execute once:
+  # Linux:
+  $ gala completion bash > /etc/bash_completion.d/gala
+  # macOS:
+  $ gala completion bash > $(brew --prefix)/etc/bash_completion.d/gala
+
+Zsh:
+  # If shell completion is not already enabled in your environment,
+  # you will need to enable it. You can execute the following once:
+  $ echo "autoload -U compinit; compinit" >> ~/.zshrc
+  
+  # To load completions for each session, execute once:
+  $ gala completion zsh > "${fpath[1]}/_gala"
+  
+  # You will need to start a new shell for this setup to take effect.
+
+Fish:
+  $ gala completion fish | source
+  
+  # To load completions for each session, execute once:
+  $ gala completion fish > ~/.config/fish/completions/gala.fish
+
+PowerShell:
+  PS> gala completion powershell | Out-String | Invoke-Expression
+  
+  # To load completions for every new session, run:
+  PS> gala completion powershell > gala.ps1
+  # and source this file from your PowerShell profile.
+`,
+		DisableFlagsInUseLine: true,
+		ValidArgs:             []string{"bash", "zsh", "fish", "powershell"},
+		Args:                  cobra.MatchAll(cobra.ExactArgs(1), cobra.OnlyValidArgs),
+		Run: func(cmd *cobra.Command, args []string) {
+			switch args[0] {
+			case "bash":
+				cmd.Root().GenBashCompletion(os.Stdout)
+			case "zsh":
+				cmd.Root().GenZshCompletion(os.Stdout)
+			case "fish":
+				cmd.Root().GenFishCompletion(os.Stdout, true)
+			case "powershell":
+				cmd.Root().GenPowerShellCompletionWithDesc(os.Stdout)
+			}
+		},
+	}
+
+	rootCmd.AddCommand(completionCmd)
+
+	// Setup config file support
+	if config.ConfigFile != "" {
+		viper.SetConfigFile(config.ConfigFile)
+	} else {
+		viper.SetConfigName("gala")
+		viper.SetConfigType("yaml")
+		viper.AddConfigPath(".")
+		viper.AddConfigPath("$HOME/.config/gala")
+		viper.AddConfigPath("/etc/gala")
+	}
+
+	viper.AutomaticEnv()
+	viper.SetEnvPrefix("GALA")
+
+	if err := viper.ReadInConfig(); err == nil && !config.Quiet {
+		fmt.Printf("Using config file: %s\n", viper.ConfigFileUsed())
+	}
+
+	// Execute
+	if err := rootCmd.Execute(); err != nil {
+		fmt.Printf("%s %v\n", errorStyle.Render("[ERROR]"), err)
+		os.Exit(1)
+	}
+}
+
+// buildLongDescription builds the long description for the command
+func buildLongDescription() string {
+	return fmt.Sprintf(`%s
+
+A professional tool for analyzing git repository contributions by counting lines 
+authored by different contributors. Supports multiple output formats, filtering 
+options, and advanced git blame analysis.
 
 Examples:
   # Show all authors across all files
@@ -673,59 +1032,24 @@ Examples:
   # Show specific user's contributions per file
   gala . "John Doe"
 
-  # Analyze user in different directory
-  gala /path/to/repo alice`, titleStyle(fmt.Sprintf("%s v%s", AppName, Version))),
+  # Export to JSON with filtering
+  gala --output json --min-lines 100 --since 2024-01-01
 
-		Args: cobra.MaximumNArgs(2),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			// Parse arguments
-			if len(args) >= 1 {
-				config.Directory = args[0]
-			} else {
-				config.Directory = "."
-			}
+  # CSV output sorted by file count
+  gala --output csv --sort files --limit 10
 
-			if len(args) >= 2 {
-				config.Username = args[1]
-			}
+  # Exclude specific authors and patterns
+  gala --exclude-author bot --exclude-pattern "*.generated.go"
 
-			// Convert to absolute path
-			absPath, err := filepath.Abs(config.Directory)
-			if err != nil {
-				return fmt.Errorf("invalid directory path: %w", err)
-			}
-			config.Directory = absPath
+Configuration:
+  Gala supports configuration files in YAML format. Place gala.yaml in:
+  - Current directory
+  - ~/.config/gala/
+  - /etc/gala/
 
-			// Create analyzer and run
-			analyzer := NewGitAnalyzer(config)
-
-			// Setup context with cancellation
-			ctx, cancel := context.WithCancel(context.Background())
-			defer cancel()
-
-			// Handle interruption gracefully
-			sigChan := make(chan os.Signal, 1)
-			signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-			go func() {
-				<-sigChan
-				fmt.Printf("\n%s Received interrupt signal, shutting down gracefully...\n",
-					warningStyle("⚠"))
-				cancel()
-			}()
-
-			return analyzer.Run(ctx)
-		},
-	}
-
-	// Add flags
-	rootCmd.Flags().IntVarP(&config.Concurrency, "concurrency", "c", 0,
-		"Number of concurrent git blame processes (default: 2*CPU cores)")
-	rootCmd.Flags().BoolVarP(&config.Verbose, "verbose", "v", false,
-		"Enable verbose output")
-
-	// Execute
-	if err := rootCmd.Execute(); err != nil {
-		fmt.Printf("%s %v\n", errorStyle("✗"), err)
-		os.Exit(1)
-	}
+Environment variables:
+  All flags can be set via environment variables with GALA_ prefix:
+  GALA_OUTPUT=json gala
+  GALA_MIN_LINES=50 gala`,
+		primaryStyle.Render(fmt.Sprintf("%s v%s", AppName, Version)))
 }
